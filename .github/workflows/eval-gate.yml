@@ -1,0 +1,62 @@
+name: eval-gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Runs on every PR with zero secrets: the scripted backend makes the whole
+  # flywheel deterministic, so CI can prove both directions — the gate catches
+  # the buggy agent AND passes the fixed one.
+  offline-gate:
+    runs-on: ubuntu-latest
+    env:
+      AGENT_BACKEND: scripted
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install
+        run: uv sync
+
+      - name: Unit tests (scorers, miner, emitter)
+        run: uv run pytest tests -q
+
+      - name: Run the flywheel against the buggy v1 agent
+        run: |
+          uv run trace2evals traffic --agent-version v1
+          uv run trace2evals mine
+          uv run trace2evals emit
+
+      - name: Gate must catch v1 (a failing metric is a failing build)
+        run: |
+          if AGENT_VERSION=v1 uv run pytest evals -q; then
+            echo "::error::the gate passed the buggy agent — the eval suite is a dashboard nobody reads"
+            exit 1
+          fi
+
+      - name: Gate must pass the fixed v2 agent
+        run: AGENT_VERSION=v2 uv run pytest evals -q
+
+  # Manual run against a real model. Needs ANTHROPIC_API_KEY (agent) and
+  # optionally OPENAI_API_KEY (DeepEval TaskCompletionMetric judge — keep the
+  # judge in a different model family than the agent under test).
+  live-gate:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install (with live + deepeval extras)
+        run: uv sync --extra live --extra deepeval
+
+      - name: Gate the live agent on the committed golden dataset
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AGENT_BACKEND: anthropic
+          AGENT_VERSION: v2
+        run: uv run pytest evals -q
