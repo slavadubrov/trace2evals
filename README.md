@@ -1,5 +1,7 @@
 # trace2evals
 
+![trace2evals diagram](docs/gen-diagram.png)
+
 Companion repo for the blog post **[Evaluating AI Agents in Production: From Traces to Test Suites](https://slavadubrov.github.io/blog/)**.
 
 An end-to-end, runnable demo of the **trace-to-eval flywheel**: run a tool-using
