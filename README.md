@@ -2,7 +2,7 @@
 
 ![trace2evals diagram](docs/gen-diagram.png)
 
-Companion repo for the blog post **[Evaluating AI Agents in Production: From Traces to Test Suites](https://slavadubrov.github.io/blog/)**.
+Companion repo for the blog post **[Evaluating AI Agents in Production: From Traces to Test Suites](https://slavadubrov.github.io/blog/2026/06/10/agent-evals-traces-to-test-suites/)**.
 
 An end-to-end, runnable demo of the **trace-to-eval flywheel**: run a tool-using
 support agent, capture its trajectories as OpenTelemetry GenAI-semconv spans,
