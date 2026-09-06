@@ -1,6 +1,6 @@
 """Deterministic scorers — cheap, fast, and they do not drift.
 
-tool_correctness is the exact function from the article. The argument and loop
+tool_correctness implements the comparison semantics in the article. Argument and loop
 checks back the "argument correctness" and "efficiency, loops, and dead ends"
 sections: right tool plus wrong arguments is still broken, and a loop detector
 is a few lines over the trace — it does not need a model.
@@ -9,6 +9,7 @@ is a few lines over the trace — it does not need a model.
 from __future__ import annotations
 
 import json
+from collections import Counter
 
 
 def tool_correctness(called: list[str], expected: list[str], mode: str = "in_order") -> float:
@@ -18,12 +19,14 @@ def tool_correctness(called: list[str], expected: list[str], mode: str = "in_ord
     - in_order: required tools must appear in relative order; extras are allowed.
     - any_order: required tools must appear; order does not matter.
     """
-    if not expected:
-        return 1.0
+    if mode not in {"exact", "in_order", "any_order"}:
+        raise ValueError(f"unknown comparison mode: {mode}")
     if mode == "exact":
         return float(called == expected)
+    if not expected:
+        return 1.0
     if mode == "any_order":
-        return len(set(expected) & set(called)) / len(set(expected))
+        return sum((Counter(expected) & Counter(called)).values()) / len(expected)
 
     # in_order: fraction of expected tools that appear in the correct relative
     # order (longest common subsequence), so one missing tool does not zero out
@@ -41,7 +44,7 @@ def tool_correctness(called: list[str], expected: list[str], mode: str = "in_ord
 def argument_mismatches(tool_calls: list[dict], expected_arguments: dict[str, dict]) -> list[str]:
     """Compare observed tool arguments with the expected ones stored in the golden.
 
-    For every tool with expected arguments, the last observed call must match on
+    For every tool with expected arguments, every observed call must match on
     each expected key. Returns human-readable mismatch descriptions (empty = pass).
     """
     mismatches = []
@@ -50,12 +53,12 @@ def argument_mismatches(tool_calls: list[dict], expected_arguments: dict[str, di
         if not observed:
             mismatches.append(f"{tool_name}: expected a call, but none was observed")
             continue
-        arguments = observed[-1]["arguments"]
-        for key, value in expected.items():
-            if arguments.get(key) != value:
-                mismatches.append(
-                    f"{tool_name}.{key}: expected {value!r}, got {arguments.get(key)!r}"
-                )
+        for call in observed:
+            arguments = call["arguments"]
+            for key, value in expected.items():
+                if key not in arguments or arguments[key] != value:
+                    actual = repr(arguments[key]) if key in arguments else "<missing>"
+                    mismatches.append(f"{tool_name}.{key}: expected {value!r}, got {actual}")
     return mismatches
 
 

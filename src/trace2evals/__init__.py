@@ -1,8 +1,7 @@
-"""trace2evals: turn agent traces into a versioned regression eval suite.
+"""Reusable deterministic scorers and a small educational evaluation pipeline."""
 
-Companion repo for "Evaluating AI Agents in Production: From Traces to Test
-Suites". The flywheel: run agent -> capture OTel traces -> mine failures ->
-cluster + dedupe -> versioned goldens -> CI gate that re-runs the agent.
-"""
+from .models import Trajectory
+from .scorers import argument_mismatches, tool_correctness
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+__all__ = ["Trajectory", "argument_mismatches", "tool_correctness"]

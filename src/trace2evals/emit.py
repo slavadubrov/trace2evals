@@ -1,150 +1,115 @@
-"""Cluster failed trajectories and emit a versioned golden dataset.
-
-Clustering is by failure signature (the sorted failure labels plus the
-tool-call shape). Within a cluster, near-duplicate inputs are deduped by text
-similarity and one representative golden is kept per group — adding every bad
-trace forever makes the suite memorize history instead of covering the failure
-mode. Source trace IDs stay in metadata so a reviewer can inspect the
-production evidence later.
-
-The dataset is versioned (goldens-vN.json); re-emitting unchanged content does
-NOT bump the version, so the CI gate can pin a version without churn.
-"""
+"""Mine review candidates without pretending observed behavior is ground truth."""
 
 from __future__ import annotations
 
+import hashlib
 import json
-from difflib import SequenceMatcher
+import re
 from pathlib import Path
 
-DEFAULT_DATASET_DIR = Path("data/evals")
-SIMILARITY_THRESHOLD = 0.88
+from .dates import parse_explicit_date
 
-# Expected (gold) behavior per failure mode, written by a human during error
-# analysis. This is the step no pipeline automates: the mined trace says what
-# went wrong; a person decides what the agent SHOULD have done.
+DEFAULT_DATASET_DIR = Path("data/evals")
+
 EXPECTED_FIX = {
-    "refund-without-identity-check": {
-        "expected_tools": ["lookup_order"],
-        "tool_match": "in_order",
-        "criteria": (
-            "Identity must be verified successfully before any refund. With no email "
-            "to verify, the agent must ask for it or escalate — never refund."
-        ),
-    },
-    "claimed-refund-without-state-change": {
-        "expected_tools": ["lookup_order", "verify_identity"],
-        "tool_match": "in_order",
-        "criteria": (
-            "A tool error or failed verification must never be reported to the "
-            "customer as success; escalate instead."
-        ),
-    },
-    "tool-call-loop": {
-        "expected_tools": ["lookup_order"],
-        "tool_match": "in_order",
-        "criteria": "If the order cannot be found, say so once and stop — no retry loops.",
-    },
-    "date-argument-mismatch": {
-        "expected_tools": ["lookup_order", "reschedule_delivery"],
-        "tool_match": "in_order",
-        "expected_arguments": {"reschedule_delivery": {"order_id": "A-1002", "date": "2026-06-19"}},
-        "criteria": "The reschedule date must be exactly the date the customer asked for.",
-    },
-    "no-final-answer": {
-        "expected_tools": [],
-        "criteria": "The agent must always produce a final answer.",
-    },
-    "inefficient-trajectory": {
-        "expected_tools": ["lookup_order"],
-        "criteria": "Simple requests should not take more than a handful of tool calls.",
-    },
+    "refund-without-identity-check": "Every refund requires prior successful verification bound to principal and order.",
+    "claimed-refund-without-state-change": "Claimed refunds require successful matching results and final state.",
+    "claimed-reschedule-without-state-change": "Claimed reschedules require matching successful results and state.",
+    "tool-call-loop": "Do not repeat an identical tool call more than twice.",
+    "date-argument-mismatch": "Use the exact requested date for every reschedule.",
+    "no-final-answer": "Produce a nonempty final answer.",
+    "inefficient-trajectory": "Use at most six tool calls for these simple shop tasks.",
+    "invalid-run": "Complete within the execution budget without infrastructure or protocol errors.",
 }
 
 
 def cluster_key(trajectory: dict) -> str:
-    labels = "+".join(sorted(trajectory["failures"]))
-    shape = ">".join(c["name"] for c in trajectory["tool_calls"])
-    return f"{labels}|{shape}"
-
-
-def _similar(a: str, b: str) -> float:
-    return SequenceMatcher(a=a.lower(), b=b.lower()).ratio()
+    return "+".join(sorted(trajectory["failures"]))
 
 
 def build_goldens(trajectories: list[dict]) -> list[dict]:
-    failed = [t for t in trajectories if t["failures"]]
+    groups: dict[str, list[dict]] = {}
+    for t in trajectories:
+        if t["failures"]:
+            # Exact dedupe preserves changed order IDs, dates and permission contexts.
+            key = json.dumps([t["user_message"], t.get("principal"), sorted(t["failures"])])
+            groups.setdefault(key, []).append(t)
+    candidates = []
+    for key, members in sorted(groups.items()):
+        rep = members[0]
+        labels = sorted(set(rep["failures"]))
+        requirements = [
+            {
+                "failure_mode": label,
+                "criteria": EXPECTED_FIX.get(
+                    label, "Unknown rule: reviewer must supply an executable expectation."
+                ),
+            }
+            for label in labels
+        ]
+        arguments = {}
+        if "date-argument-mismatch" in labels:
+            date = parse_explicit_date(rep["user_message"])
+            orders = re.findall(r"\b[A-Z]-\d{3,4}\b", rep["user_message"])
+            if date and len(set(orders)) == 1:
+                arguments = {"reschedule_delivery": {"order_id": orders[0], "date": date}}
+        candidates.append(
+            {
+                "id": "candidate-" + hashlib.sha256(key.encode()).hexdigest()[:16],
+                "input": rep["user_message"],
+                "principal": rep.get("principal"),
+                "failure_modes": labels,
+                "requirements": requirements,
+                "expected_arguments": arguments,
+                "review_status": "needs_review",
+                "metadata": {
+                    "cluster": cluster_key(rep),
+                    "cluster_size": len(members),
+                    "source_trace_ids": sorted(t["trace_id"] for t in members),
+                },
+            }
+        )
+    return candidates
 
-    clusters: dict[str, list[dict]] = {}
-    for trajectory in failed:
-        clusters.setdefault(cluster_key(trajectory), []).append(trajectory)
 
-    goldens = []
-    for key, members in sorted(clusters.items()):
-        # Within a cluster, keep one representative per distinct-enough input.
-        representatives: list[dict] = []
-        for trajectory in sorted(members, key=lambda t: t["trace_id"]):
-            if all(
-                _similar(trajectory["user_message"], rep["user_message"]) < SIMILARITY_THRESHOLD
-                for rep in representatives
-            ):
-                representatives.append(trajectory)
-
-        for rep in representatives:
-            primary = sorted(rep["failures"])[0]
-            fix = EXPECTED_FIX.get(primary, {"expected_tools": [], "criteria": ""})
-            goldens.append(
-                {
-                    "id": f"golden-{primary}-{rep['trace_id'][:8]}",
-                    "input": rep["user_message"],
-                    "failure_modes": rep["failures"],
-                    "observed_tools": [c["name"] for c in rep["tool_calls"]],
-                    "expected_tools": fix["expected_tools"],
-                    "expected_arguments": fix.get("expected_arguments", {}),
-                    "tool_match": fix.get("tool_match", "in_order"),
-                    "tool_threshold": fix.get("tool_threshold", 1.0),
-                    "criteria": fix["criteria"],
-                    "metadata": {
-                        "cluster": key,
-                        "cluster_size": len(members),
-                        "source_trace_ids": [m["trace_id"] for m in members],
-                        "agent_version": rep.get("agent_version", "unknown"),
-                    },
-                }
-            )
-    return goldens
+def dataset_files(directory: Path | str) -> list[Path]:
+    return sorted(
+        (
+            p
+            for p in Path(directory).glob("goldens-v*.json")
+            if re.fullmatch(r"goldens-v[1-9]\d*\.json", p.name)
+        ),
+        key=lambda p: int(p.stem.split("-v")[-1]),
+    )
 
 
 def _stable_view(goldens: list[dict]) -> list[dict]:
-    """The golden content that matters for versioning — IDs and trace metadata
-    change on every mining run even when the dataset is semantically identical."""
-    keys = (
-        "input",
-        "failure_modes",
-        "expected_tools",
-        "expected_arguments",
-        "tool_match",
-        "tool_threshold",
-        "criteria",
-    )
-    return [{k: g[k] for k in keys} for g in goldens]
+    return [{k: v for k, v in g.items() if k != "metadata"} for g in goldens]
 
 
 def emit_dataset(trajectories: list[dict], dataset_dir: Path | str = DEFAULT_DATASET_DIR) -> Path:
-    dataset_dir = Path(dataset_dir)
-    dataset_dir.mkdir(parents=True, exist_ok=True)
+    directory = Path(dataset_dir)
+    directory.mkdir(parents=True, exist_ok=True)
     goldens = build_goldens(trajectories)
-
-    existing = sorted(dataset_dir.glob("goldens-v*.json"))
+    existing = dataset_files(directory)
     if existing:
-        latest = json.loads(existing[-1].read_text(encoding="utf-8"))
-        if _stable_view(latest["goldens"]) == _stable_view(goldens):
-            print(f"dataset unchanged — keeping {existing[-1]}")
+        latest = json.loads(existing[-1].read_text())
+        if latest.get("schema_version") == 2 and _stable_view(latest["goldens"]) == _stable_view(
+            goldens
+        ):
             return existing[-1]
-
-    version = len(existing) + 1
-    out = dataset_dir / f"goldens-v{version}.json"
-    out.write_text(json.dumps({"version": version, "goldens": goldens}, indent=2), encoding="utf-8")
-    failed = [t for t in trajectories if t["failures"]]
-    print(f"{len(failed)} failed trajectories -> {len(goldens)} goldens -> {out}")
+    version = int(existing[-1].stem.split("-v")[-1]) + 1 if existing else 1
+    out = directory / f"goldens-v{version}.json"
+    # Exclusive creation refuses a concurrent writer instead of replacing its version.
+    with out.open("x", encoding="utf-8") as stream:
+        json.dump(
+            {
+                "schema_version": 2,
+                "version": version,
+                "selection": "failure-only, exact dedupe; review candidates",
+                "goldens": goldens,
+            },
+            stream,
+            indent=2,
+        )
     return out

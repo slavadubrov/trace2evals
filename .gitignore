@@ -6,3 +6,7 @@ __pycache__/
 .env
 .deepeval/
 .deepeval-cache.json
+dist/
+build/
+data/demo/
+data/runs/

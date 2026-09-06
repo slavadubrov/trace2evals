@@ -1,19 +1,15 @@
 [project]
 name = "trace2evals"
-version = "0.1.0"
+version = "0.2.0"
 description = "Demo: turn agent traces into a versioned regression eval suite with a CI gate"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "opentelemetry-sdk>=1.27.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
 ]
 
 [project.optional-dependencies]
-# Run the agent against a real model instead of the scripted backend.
-live = ["anthropic>=0.92.0"]
-# Extra DeepEval metrics (ToolCorrectnessMetric, TaskCompletionMetric judge) in the gate.
-deepeval = ["deepeval>=3.0.0"]
+live = ["openai>=2.0.0"]
 
 [project.scripts]
 trace2evals = "trace2evals.cli:main"
@@ -30,6 +26,9 @@ packages = ["src/trace2evals"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "evals"]
