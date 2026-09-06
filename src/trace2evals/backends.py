@@ -1,16 +1,4 @@
-"""Two interchangeable agent backends behind one conversation interface.
-
-- ScriptedBackend: a deterministic rule policy that emulates how an LLM drives
-  the tool loop. It needs no API key, so the whole flywheel runs offline and
-  the README walkthrough is reproducible. AGENT_VERSION=v1 reproduces the
-  production bugs; v2 is the fixed agent.
-- AnthropicBackend: the same loop driven by a real Claude model. Set
-  ANTHROPIC_API_KEY (and `uv sync --extra live`) and every command works
-  unchanged against live traffic.
-
-The agent loop only sees Action = Final | list[ToolUse], so traces, mining,
-and the CI gate are identical for both backends.
-"""
+"""Scripted teaching policy and explicit opt-in OpenAI Responses backend."""
 
 from __future__ import annotations
 
@@ -33,6 +21,7 @@ class ToolUse:
 @dataclass
 class Final:
     text: str
+    claims: list[dict] = field(default_factory=list)
 
 
 Action = Final | list[ToolUse]
@@ -61,7 +50,10 @@ V2_SYSTEM_PROMPT = V1_SYSTEM_PROMPT + (
     "do not refund; ask for the email or escalate to a human. "
     "If a tool returns an error, never tell the customer the action succeeded, and do "
     "not retry the same call with the same arguments. "
-    "When rescheduling, use exactly the date the customer asked for, in YYYY-MM-DD."
+    "When rescheduling, use exactly the date the customer asked for, in YYYY-MM-DD. "
+    "For dates without a year, this synthetic shop uses calendar year 2026. "
+    "If the date is missing or ambiguous, ask for clarification. "
+    "Verification requires the order ID as well as the customer ID and email."
 )
 
 _ORDER_RE = re.compile(r"\b([A-Z]-\d{3,4})\b")
@@ -115,12 +107,20 @@ class ScriptedConversation:
 
         if wants_reschedule:
             if not any(c.name == "reschedule_delivery" for c in self.calls):
-                date = parse_explicit_date(self.user_message) or "2026-06-19"
+                date = parse_explicit_date(self.user_message)
+                if date is None:
+                    return Final("Please provide an unambiguous delivery date.")
                 if self.version == "v1":
                     # v1 bug: off-by-two date argument; the trace still looks normal.
                     date = shift_date(date, -2)
                 return [self._tool("reschedule_delivery", {"order_id": order_id, "date": date})]
-            return Final(f"Done — delivery for order {order_id} has been rescheduled.")
+            result = next(c for c in self.calls if c.name == "reschedule_delivery")
+            if result.is_error:
+                return Final("I could not reschedule delivery.")
+            return Final(
+                f"Delivery for order {order_id} has been rescheduled.",
+                [{"kind": "reschedule", "order_id": order_id}],
+            )
 
         if not wants_refund:
             return Final(f"Order {order_id} is currently {order['status']}.")
@@ -130,9 +130,15 @@ class ScriptedConversation:
             if refunds[-1].is_error:
                 if self.version == "v1":
                     # v1 bug: misreads the tool error as success.
-                    return Final("Your refund has been processed.")
+                    return Final(
+                        "Your refund has been processed.",
+                        [{"kind": "refund", "order_id": order_id}],
+                    )
                 return Final(f"I couldn't refund order {order_id}: it has not been delivered yet.")
-            return Final(f"Your refund for order {order_id} has been processed.")
+            return Final(
+                f"Your refund for order {order_id} has been processed.",
+                [{"kind": "refund", "order_id": order_id}],
+            )
 
         refund_call = self._tool("issue_refund", {"order_id": order_id, "amount": order["amount"]})
         verifications = [c for c in self.calls if c.name == "verify_identity"]
@@ -154,7 +160,10 @@ class ScriptedConversation:
             return [refund_call]
         if email:
             return [
-                self._tool("verify_identity", {"customer_id": order["customer"], "email": email})
+                self._tool(
+                    "verify_identity",
+                    {"customer_id": order["customer"], "order_id": order_id, "email": email},
+                )
             ]
         return Final(
             "To issue a refund I first need to verify your identity — "
@@ -162,95 +171,136 @@ class ScriptedConversation:
         )
 
 
-class AnthropicConversation:
-    """The same tool loop driven by a real Claude model."""
+FINAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["refund", "reschedule"]},
+                    "order_id": {"type": "string"},
+                },
+                "required": ["kind", "order_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["text", "claims"],
+    "additionalProperties": False,
+}
 
-    backend_name = "anthropic"
 
-    def __init__(self, version: str) -> None:
-        import anthropic
+class OpenAIConversation:
+    """Bounded Responses tool loop; no automatic retries or backend fallback."""
 
+    backend_name = "openai"
+
+    def __init__(self, version: str, model: str | None = None, client=None):
         self.version = version
-        self._client = anthropic.Anthropic()
-        self._model = os.environ.get("AGENT_MODEL", "claude-opus-4-8")
-        self._system = V2_SYSTEM_PROMPT if version == "v2" else V1_SYSTEM_PROMPT
-        self._messages: list[dict] = []
-        self.last_usage: dict | None = None
+        self.model = model or os.environ.get("AGENT_MODEL", "gpt-5.6-luna")
+        if client is None:
+            from openai import OpenAI
+
+            client = OpenAI(timeout=30.0, max_retries=0)
+        self._client = client
+        self._system = (V2_SYSTEM_PROMPT if version == "v2" else V1_SYSTEM_PROMPT) + (
+            " Return final text and structured claims. List only actions you claim completed, "
+            "with their order IDs; denied or pending actions are not completion claims."
+        )
+        self._messages: list = []
+        self.last_usage = None
+        self.response_model = None
 
     def start(self, user_message: str) -> Action:
         self._messages.append({"role": "user", "content": user_message})
         return self._step()
 
     def on_tool_results(self, results: list[ToolResult]) -> Action:
-        self._messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": r.tool_use_id,
-                        "content": r.content,
-                        "is_error": r.is_error,
-                    }
-                    for r in results
-                ],
-            }
+        self._messages.extend(
+            {"type": "function_call_output", "call_id": r.tool_use_id, "output": r.content}
+            for r in results
         )
         return self._step()
 
     def _step(self) -> Action:
         from .tools import TOOLS
 
-        response = self._client.messages.create(
-            model=self._model,
-            max_tokens=1024,
-            system=self._system,
-            tools=TOOLS,
-            messages=self._messages,
+        response = self._client.responses.create(
+            model=self.model,
+            instructions=self._system,
+            input=self._messages,
+            tools=[
+                {
+                    "type": "function",
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["input_schema"],
+                    "strict": True,
+                }
+                for t in TOOLS
+            ],
+            parallel_tool_calls=False,
+            reasoning={"effort": "low"},
+            max_output_tokens=2048,
+            store=False,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "support_answer",
+                    "schema": FINAL_SCHEMA,
+                    "strict": True,
+                }
+            },
         )
         self.last_usage = {
             "input_tokens": response.usage.input_tokens,
             "output_tokens": response.usage.output_tokens,
         }
-        if response.stop_reason == "tool_use":
-            self._messages.append({"role": "assistant", "content": response.content})
-            return [
-                ToolUse(block.id, block.name, dict(block.input))
-                for block in response.content
-                if block.type == "tool_use"
-            ]
-        return Final(next((b.text for b in response.content if b.type == "text"), ""))
+        self.response_model = response.model
+        if response.status != "completed":
+            raise ValueError("incomplete model response")
+        # Preserve reasoning items as well as calls for Responses continuation.
+        self._messages.extend(response.output)
+        calls = [
+            ToolUse(b.call_id, b.name, json.loads(b.arguments))
+            for b in response.output
+            if b.type == "function_call"
+        ]
+        if calls:
+            if len({c.id for c in calls}) != len(calls):
+                raise ValueError("duplicate tool call IDs")
+            return calls
+        payload = json.loads(response.output_text)
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"text", "claims"}
+            or not isinstance(payload["text"], str)
+            or not payload["text"].strip()
+            or not isinstance(payload["claims"], list)
+        ):
+            raise ValueError("invalid final response")
+        for claim in payload["claims"]:
+            if (
+                not isinstance(claim, dict)
+                or set(claim) != {"kind", "order_id"}
+                or claim["kind"] not in {"refund", "reschedule"}
+                or not isinstance(claim["order_id"], str)
+                or not claim["order_id"]
+            ):
+                raise ValueError("invalid completion claim")
+        return Final(**payload)
 
 
-def new_conversation(
-    version: str | None = None, backend: str | None = None
-) -> ScriptedConversation | AnthropicConversation:
-    """Pick the backend: AGENT_BACKEND=scripted|anthropic|auto (default auto).
-
-    Auto means: use the real model when ANTHROPIC_API_KEY is set and the
-    `anthropic` package is installed, otherwise fall back to the scripted
-    backend so the demo always runs.
-    """
-    version = version or os.environ.get("AGENT_VERSION", "v1")
-    backend = backend or os.environ.get("AGENT_BACKEND", "auto")
-
-    if backend == "auto":
-        backend = "scripted"
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            try:
-                import anthropic  # noqa: F401
-
-                backend = "anthropic"
-            except ImportError:
-                pass
-
-    if backend == "anthropic":
-        try:
-            return AnthropicConversation(version)
-        except ImportError as exc:  # pragma: no cover
-            raise RuntimeError(
-                "AGENT_BACKEND=anthropic needs the live extra: uv sync --extra live"
-            ) from exc
+def new_conversation(version: str | None = None, backend: str | None = None):
+    version = version or os.environ.get("AGENT_VERSION", "v2")
+    backend = backend or os.environ.get("AGENT_BACKEND", "scripted")
+    if version not in {"v1", "v2"}:
+        raise ValueError("agent version must be v1 or v2")
     if backend == "scripted":
         return ScriptedConversation(version=version)
-    raise ValueError(f"unknown AGENT_BACKEND {backend!r} (use scripted, anthropic, or auto)")
+    if backend == "openai":
+        return OpenAIConversation(version)
+    raise ValueError("backend must be scripted or openai")

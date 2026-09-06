@@ -21,7 +21,8 @@ def test_in_order_allows_harmless_extra_calls():
 
 
 def test_empty_expected_passes():
-    assert tool_correctness(["anything"], [], "exact") == 1.0
+    assert tool_correctness(["anything"], [], "exact") == 0.0
+    assert tool_correctness([], [], "exact") == 1.0
 
 
 def test_loop_is_not_full_credit():
@@ -56,3 +57,12 @@ def test_argument_mismatches():
     assert argument_mismatches([], expected) == [
         "reschedule_delivery: expected a call, but none was observed"
     ]
+
+
+def test_modes_multiplicity_and_every_invocation():
+    with pytest.raises(ValueError):
+        tool_correctness([], [], "typo")
+    assert tool_correctness(["x"], ["x", "x"], "any_order") == 0.5
+    calls = [{"name": "write", "arguments": {"x": 0}}, {"name": "write", "arguments": {"x": 1}}]
+    assert argument_mismatches(calls, {"write": {"x": 1}})
+    assert argument_mismatches([{"name": "write", "arguments": {}}], {"write": {"x": None}})

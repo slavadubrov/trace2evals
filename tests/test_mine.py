@@ -19,7 +19,7 @@ def scripted_backend(monkeypatch):
 def _mine(tmp_path):
     spans = tmp_path / "spans.jsonl"
     tracer = init_tracing(spans_path=spans)
-    run_scenarios(tracer)
+    run_scenarios(tracer, version=__import__("os").environ["AGENT_VERSION"])
     trajectories = load_trajectories(spans)
     for trajectory in trajectories:
         trajectory.failures = flag_failures(trajectory)

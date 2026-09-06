@@ -30,12 +30,22 @@ _DATE_RE = re.compile(r"\b(" + "|".join(_MONTHS) + r")\s+(\d{1,2})\b", re.IGNORE
 
 def parse_explicit_date(text: str) -> str | None:
     """Extract an explicit 'Month Day' mention as an ISO date, or None."""
-    match = _DATE_RE.search(text)
-    if match is None:
+    iso = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", text)
+    matches = list(_DATE_RE.finditer(text))
+    if len(iso) + len(matches) != 1:
         return None
-    month = _MONTHS[match.group(1).lower()]
-    day = int(match.group(2))
-    return f"{DEMO_YEAR}-{month:02d}-{day:02d}"
+    try:
+        if iso:
+            return datetime.strptime(iso[0], "%Y-%m-%d").date().isoformat()
+        match = matches[0]
+        year = re.match(r",?\s+(\d{4})\b", text[match.end() :])
+        return (
+            datetime(int(year[1]) if year else DEMO_YEAR, _MONTHS[match[1].lower()], int(match[2]))
+            .date()
+            .isoformat()
+        )
+    except ValueError:
+        return None
 
 
 def shift_date(iso_date: str, days: int) -> str:

@@ -24,7 +24,7 @@ def test_one_golden_per_cluster_with_evidence_metadata():
     near_duplicates = [
         _trajectory(
             f"trace-{i:04d}",
-            f"Refund order A-1002 right now, ticket {i}.",
+            "Refund order A-1002 right now.",
             ["refund-without-identity-check"],
             ["lookup_order", "issue_refund"],
         )
@@ -91,3 +91,33 @@ def test_version_does_not_churn_when_content_is_unchanged(tmp_path):
     assert third.name == "goldens-v2.json"
     payload = json.loads(third.read_text())
     assert payload["version"] == 2
+
+
+def test_numeric_versions_gaps_and_all_labels(tmp_path):
+    t = _trajectory(
+        "trace-a",
+        "Move order A-1001 to July 22.",
+        ["date-argument-mismatch", "tool-call-loop"],
+        ["reschedule_delivery"],
+    )
+    candidates = build_goldens([t])
+    assert len(candidates[0]["requirements"]) == 2
+    assert candidates[0]["expected_arguments"]["reschedule_delivery"] == {
+        "order_id": "A-1001",
+        "date": "2026-07-22",
+    }
+    first = emit_dataset([t], tmp_path)
+    first.rename(tmp_path / "goldens-v9.json")
+    t["user_message"] = "Move order A-1001 to July 23."
+    assert emit_dataset([t], tmp_path).name == "goldens-v10.json"
+    assert emit_dataset([t], tmp_path).name == "goldens-v10.json"
+    t["user_message"] = "Move order A-1001 to July 24."
+    assert emit_dataset([t], tmp_path).name == "goldens-v11.json"
+
+
+def test_near_duplicates_with_distinct_resources_are_not_collapsed():
+    rows = [
+        _trajectory(str(i), f"Refund order A-100{i} now.", ["refund-without-identity-check"], [])
+        for i in (1, 2)
+    ]
+    assert len(build_goldens(rows)) == 2
