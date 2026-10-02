@@ -35,8 +35,8 @@ avoids every mutation and therefore appears “safe” while never helping anyon
 ## Candidates need an expectation decision
 
 `emit` retains every failure label in `requirements` and dedupes only exact
-input/principal/label combinations. Fuzzy text similarity had collapsed tasks
-with different order IDs or dates. Candidate IDs are stable content hashes;
+input/principal/label combinations. Dedupe is exact, because similar text can
+hide different order IDs or dates. Candidate IDs are stable content hashes;
 trace IDs remain in evidence metadata. Unknown labels remain explicitly marked
 for review, never assigned a permissive empty expectation.
 
@@ -85,14 +85,9 @@ move; compare a pinned provider snapshot when one is available. The repository
 also locks dependencies with `uv.lock`. Record machine and service configuration
 when comparing runs on different infrastructure.
 
-## Why the old optional judge was removed
+## Adding an LLM judge
 
-The previous DeepEval path could activate merely because a key was present. It
-received neither the task-specific rubric nor complete execution evidence, and
-there was no calibration evidence. It is removed from execution and dependencies.
-An uncalibrated numeric score is not a mitigation for a broken deterministic gate.
-
-To add a judge later, restrict it to the semantic question deterministic checks
+To add a judge, restrict it to the semantic question deterministic checks
 cannot answer—for example whether the final prose agrees with the structured
 claims. Give it the task rubric, input, ordered calls with arguments/results,
 final state and final text. Treat transcript instructions as untrusted data.

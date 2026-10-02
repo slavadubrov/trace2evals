@@ -19,8 +19,7 @@ writes. Order reads are public in this synthetic shop; production read access
 requires its own authorization policy.
 
 Full refunds must equal the stored order amount and require delivered status.
-The old unsupported “within 30 days” policy was removed: the fixture had no
-purchase timestamp and could not enforce it. Amount validation rejects booleans,
+Amount validation rejects booleans,
 strings, negative values, NaN, infinity and mismatched totals.
 
 A full refund's operation identity is the order ID. Repeating it in one session
