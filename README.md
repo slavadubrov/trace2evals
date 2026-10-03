@@ -105,9 +105,8 @@ command. There is no background server to restart.
 
 ## Install and reuse
 
-The repository already had a build configuration; this revision makes the
-installed package usable outside its checkout, including the bundled suite.
-It does not publish to PyPI.
+The package installs and runs outside the checkout, including the bundled
+suite. It is not published to PyPI.
 
 ```bash
 uv build
@@ -165,10 +164,10 @@ Read [architecture and boundaries](docs/architecture.md) and
   idempotency requires durable transactional storage across processes and retries.
 - Completion claims are structured and checked against tool results and state.
   Free-text truthfulness, refusal helpfulness and tone are not measured by this
-  deterministic gate. The old uncalibrated LLM judge was removed, not declared
-  reliable. The evaluation guide explains the calibration needed to add one.
+  deterministic gate. No LLM judge ships with the repository; the evaluation
+  guide explains the calibration needed to add one.
 - The JSONL adapter supports this repository's **schema v2**, not arbitrary OTel
   exports or a claim of complete GenAI semantic-convention compliance.
 - Traces contain full synthetic inputs and tool data. Redact real data before
-  importing it, and apply retention/access controls. Automatic OTLP shipping was
-  removed; environment variables do not silently export content elsewhere.
+  importing it, and apply retention/access controls. Traces are written to
+  local JSONL only; nothing is exported over the network.
